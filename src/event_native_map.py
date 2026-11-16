@@ -108,6 +108,7 @@ class NativeEventMap:
                     rate=p.call('_Z19GetAreaPrisonerRateii9WorldType',world,area,world_type)
                     bonuses.append(struct.pack('<4I',world,area,world_type,rate))
         p.put(HEADER+140,t.blob(b''.join(bonuses)));p.put(HEADER+144,len(bonuses))
+        if t.selected==t.NATIVE_EVENT:self.merge_native_records(table,state)
         for i,(_,_,index) in enumerate(table['indices']):
             saved=state['stages'].get(t.data[t.selected]['stages'][index]['local_stage_key'],{})
             p.put(table['records']+i*64+12,int(saved.get('wins',0)>0));p.put(table['records']+i*64+16,saved.get('best_time',0))
@@ -119,6 +120,32 @@ class NativeEventMap:
                           (168,table['prisoners']),(172,table['prisoner_count']),(176,int(self.has_prisoners(0))),
                           (180,0),(184,int(t.data[t.selected]['controller']=='parts')),(196,self.cat_draw_task)):
             p.put(HEADER+off,value)
+    def merge_native_records(self,table,state):
+        """协力作战与原生路径（里地图 EVENT）为同一活动（EventTrial.NATIVE_EVENT），两边的通关记录互相补齐。
+        原生路径中的战斗不经宿主登记，通关与最短时间只在原生存档中：并入本活动的进度。经 P1 / P2 取得的胜利，原生结算
+        读到的是宿主已登记的通关（地图钩子），不再写原生存档的通关位：此处补写（当场的胜利由 save_result 写入），原生路径
+        的地图随之显示通关。调用时 H+80 为 0，以下原生读取不经地图钩子（map_stage_clear / map_stage_time）。"""
+        t=self.t;p=self.p;wt=self.routes[t.selected]['world_type'];stages=t.data[t.selected]['stages'];merged=[];written=[]
+        for world,a,slot,index in table['world_indices']:
+            saved=state['stages'].get(stages[index]['local_stage_key'])
+            if not p.call('_ZN7AppMain20IsStageClearSaveDataEiii9WorldType',t.app,world,a,slot,wt):
+                if saved and saved.get('wins'):self.add_native_clear(world,a,slot);written.append(stages[index]['id'])
+                continue
+            saved=state['stages'].setdefault(stages[index]['local_stage_key'],{'attempts':0,'wins':0})
+            time=p.call('_ZN7AppMain25GetStageClearTimeSaveDataEiii9WorldType',t.app,world,a,slot,wt)
+            best=min((v for v in (saved.get('best_time'),time) if v),default=0)
+            if saved['wins'] and best==(saved.get('best_time') or 0):continue
+            saved['attempts']=max(saved['attempts'],1);saved['wins']=max(saved['wins'],1)
+            if best:saved['best_time']=best
+            merged.append(stages[index]['id'])
+        if merged:t.dirty=True;t.flush()
+        if written:p.call('_ZN7AppMain17WriteMainSaveDataEv',t.app)
+        if merged or written:p.log('HISTORICAL_NATIVE_RECORDS_MERGED',t.selected,merged,written)
+    def add_native_clear(self,world,a,slot):
+        """写原生存档的通关位（原生 AddStageClearSaveData；期间 H+80 置 0，不经地图钩子）。"""
+        p=self.p;hooked=p.word(HEADER+80);p.put(HEADER+80,0)
+        p.call('_ZN7AppMain21AddStageClearSaveDataEiii9WorldType',self.t.app,world,a,slot,self.routes[self.t.selected]['world_type'])
+        p.put(HEADER+80,hooked)
     def has_prisoners(self,world):
         return any(a['world']==world and a['prisoner_id']>=0 and any(m['pow_max'] for m in a['markers'])
                    for a in self.active_manifest()['areas'])
@@ -144,10 +171,13 @@ class NativeEventMap:
             # 活动地图 BACK 的目的场景（app+0xb16c，基地“出擊”写入 72 = 回到女教官基地）在按下 POW 时被原生清零，
             # 从俘虏页回到活动地图后 BACK 因此直接进入主菜单。进入活动地图时记下该值，重新进入（场景 158 / 159、
             # 场景 160 的入场状态 4 / 7）时若为 0 则写回（2026-11-12）。
+            # 只记离开基地后的第一个值：地图底栏的 DECK、MEDAL 按下时原生把该字段写为 158（子画面返回活动地图用，
+            # 返回时取走清零），记下它会使其后的地图 BACK 回到地图自身、无法退出（2026-11-16）。
             scene=p.word(app+0x22bc)
             if p.word(HEADER+84) and scene in (158,159,160):
                 target=p.word(app+0xb16c)
-                if target:self.return_scene=target
+                if target:
+                    if not getattr(self,'return_scene',0) and target not in (158,159,160):self.return_scene=target
                 elif getattr(self,'return_scene',0) and (scene!=160 or p.word(app+0x22dc) in (4,7)):
                     p.put(app+0xb16c,self.return_scene)
             elif scene==67:self.return_scene=0
@@ -179,6 +209,7 @@ class NativeEventMap:
         if won:saved['best_time']=min(saved.get('best_time') or time,time)
         for i,(world,a,slot,index) in enumerate(table['world_indices']):
             if index==record['index']:
+                if won and t.selected==t.NATIVE_EVENT:self.add_native_clear(world,a,slot)
                 p.put(table['records']+i*64+12,int(saved['wins']>0));p.put(table['records']+i*64+16,saved.get('best_time',0))
                 maximum=p.word(table['records']+i*64+40)
                 saved['captures']=min(maximum,max(0,saved.get('captures',0)))

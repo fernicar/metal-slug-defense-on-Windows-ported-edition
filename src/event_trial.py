@@ -24,6 +24,10 @@ class EventTrial:
     # 2026-10-15：活动战败沿用原生接关流程（接关确认窗，可花勋章再战；取消后确认脱离战斗），结算仍在原生结束战斗时由
     # event_end 钩子交给宿主。此前接关窗出现即由宿主结算，战败画面直接黑场转回地图。False 时恢复旧行为。
     NATIVE_CONTINUE=True
+    # 里地图 EVENT 按钮进入的原生合作活动（原生路径）与活动浏览页的“协力作战”P1 / P2 为同一活动、同一份进度
+    # （2026-11-16 用户说明）：活动积分（原生 SurvivalPoint）两条路径共用（shared_point），原生路径的通关记录并入
+    # 本活动的进度（event_native_map.merge_native_records）。
+    NATIVE_EVENT='cooperation_2016_current'
     def __init__(self,p,root):
         self.p=p;self.root=Path(root);self.app=0;self.overlay=None;self.selected=None
         self.catalog=json.loads((self.root/'historical_events/catalog.json').read_text(encoding='utf-8'))['events']
@@ -40,7 +44,7 @@ class EventTrial:
         if self.progress.get('schema')!=1:raise ValueError('Unsupported Event progress schema')
         self.tables={};self.shop_tables={};self.native_shop_active=False;self.active_battle=None;self.last_scene=None
         self.last_message='';self.dirty=False;self.page=0;self.revision=0;self.hitboxes=[]
-        self.renderer=None;self.image=None;self.original_currency=None;self.started=False;self.result=None
+        self.renderer=None;self.image=None;self.started=False;self.result=None
         self.transition_action=None;self.transition_frame=0
         p.uc.lib.msd_enable_historical_event_hooks()
         for key,d in self.data.items():
@@ -208,6 +212,36 @@ class EventTrial:
             rows=self.data[self.selected].get('shop',{}).get('rows',[])
             state['purchase_counts']={str(r['id']):state['inventory'].get(str(r['id']),0)//max(1,r['quantity']) for r in rows}
         return state
+    # ---------- 活动积分（原生 SurvivalPoint 字段）的归属 ----------
+    # 原生字段平时即原生路径与协力作战共用的积分。进入其他活动时该活动的货币占用此字段（原生兑换店与战斗按它读写），
+    # 进度文件以 survival_point_owner 记下占用者、以 baseline_survival_currency 保存共用积分；离开时写回。
+    # 26.11.14 及更早：共用积分只在首次进入活动时记下一次，其后每次离开活动都把原生字段恢复为该旧值，原生路径之后
+    # 取得的积分因此丢失；协力作战 P1 / P2 的积分另存于活动进度，与原生路径互不相通。
+    def shared_point(self):
+        """原生路径与协力作战共用的活动积分：原生字段未被其他活动占用时读取字段并存入进度，被占用时取已保存的值。"""
+        p=self.p;progress=self.progress
+        if 'survival_point_owner' not in progress:
+            live=p.call('_ZN7AppMain24GetSurvivalPointSaveDataEv',self.app)
+            if not progress.get('survival_point_shared'):
+                live=self.merge_legacy_point(live);progress['survival_point_shared']=True
+            progress['baseline_survival_currency']=live
+        return progress['baseline_survival_currency']
+    def merge_legacy_point(self,live):
+        """旧进度的一次性合并：取原生字段与 P1 / P2 积分中较大者（两者此前分开记录，上次在协力作战内退出时相等）；
+        原生字段与其他活动的货币相同（上次在该活动内退出，字段为该活动的货币）时改取旧记录值。"""
+        events=self.progress['events'];old=self.progress.get('baseline_survival_currency')
+        coop=events.get(self.NATIVE_EVENT,{}).get('currency',0)
+        if old is not None and live not in (old,coop) and any(e.get('currency')==live for k,e in events.items() if k!=self.NATIVE_EVENT):live=old
+        self.p.log('HISTORICAL_POINT_MERGE',live,coop,old)
+        return max(live,coop)
+    def release_point(self):
+        """其他活动的货币让出原生字段：写回共用积分并写入原生存档，然后清除占用标记（标记清除时存档中的字段已恢复）。
+        存档以 WriteMainSaveDataExe 当场写入（WriteMainSaveData 为延后写入）。"""
+        if 'survival_point_owner' not in self.progress:return
+        p=self.p
+        p.call('_ZN7AppMain24SetSurvivalPointSaveDataEi',self.app,self.progress['baseline_survival_currency'])
+        p.call('_ZN7AppMain20WriteMainSaveDataExeEv',self.app)
+        del self.progress['survival_point_owner'];self.dirty=True;self.flush()
     def transition(self,action):
         if self.transition_action is not None:return False
         self.app=self.p.app_instance();self.transition_action=action;self.transition_frame=self.p.frame
@@ -226,9 +260,7 @@ class EventTrial:
         self.native_shop_active=False
         for i,raw in enumerate(self.original_groups):p.write(self.groups+i*8,raw)
         p.write(self.db+0x20,self.original_survival)
-        if self.original_currency is None:
-            self.original_currency=self.progress.setdefault('baseline_survival_currency',p.call('_ZN7AppMain24GetSurvivalPointSaveDataEv',self.app))
-            self.dirty=True;self.flush()
+        shared=self.shared_point()
         self.selected=key;self.selected_phase=phase_id;d=self.data[key];t=self.mission_table(key,phase_id)
         shop=self.active_shop_table()
         if shop:
@@ -238,8 +270,14 @@ class EventTrial:
         # 自制 EVENT 的关卡记录只经地图钩子按关卡编号查找（map_mission），不借用原生关卡组。
         if group is not None:p.write(self.groups+group*8,struct.pack('<II',t['missions'],t['count']))
         if 'ex' in t:p.write(self.db+0x20,struct.pack('<4I',t['ex'],t['ex_count'],t['drops'],t['drop_count']))
-        self.state();self.overlay=None;self.page=0;self.revision+=1;p.put(HEADER,MAGIC);p.put(HEADER+4,0)
-        p.call('_ZN7AppMain24SetSurvivalPointSaveDataEi',self.app,self.state()['currency'])
+        state=self.state();self.overlay=None;self.page=0;self.revision+=1;p.put(HEADER,MAGIC);p.put(HEADER+4,0)
+        if key==self.NATIVE_EVENT:
+            # 协力作战的积分即原生字段（与原生路径共用）；此前字段为其他活动的货币时先恢复。
+            self.release_point()
+            state['currency']=shared;state['score_peak']=max(state.get('score_peak',0),shared)
+        else:self.progress['survival_point_owner']=key
+        self.dirty=True;self.flush()
+        p.call('_ZN7AppMain24SetSurvivalPointSaveDataEi',self.app,state['currency'])
         p.put(self.app+0xc63c,4);p.put(self.app+0xc06c,1);p.put(self.app+0xc8c8,6)
         # 女教官基地的原生“出擊”进入 EventMSD 场景（158），由此处启用的历史数据回应。
         self.native_map.enable()
@@ -304,6 +342,9 @@ class EventTrial:
                 self.p.log('HISTORICAL_SHUTTER_OPEN')
             return
         self.last_scene=self.p.word(self.app+0x22bc)
+        # 上次在其他活动内退出游戏时原生字段留有该活动的货币：到主菜单时恢复为共用积分，原生路径随后读到的即为该积分。
+        if self.selected is None and 'survival_point_owner' in self.progress and self.last_scene==28 and self.p.word(self.app+0x22dc)==1:
+            self.p.log('HISTORICAL_POINT_RESTORE',self.progress['survival_point_owner']);self.release_point()
         self.native_map.update()
         self.native_selector.update()
         self.browser.update()
@@ -437,8 +478,7 @@ class EventTrial:
         for i,raw in enumerate(self.original_groups):p.write(self.groups+i*8,raw)
         p.write(self.db+0x20,self.original_survival)
         p.write(HEADER,b'\0'*232)
-        if self.selected is not None and self.original_currency is not None:
-            p.call('_ZN7AppMain24SetSurvivalPointSaveDataEi',self.app,self.original_currency)
+        self.release_point()
         self.selected=None;self.selected_phase=None;self.overlay=None;self.native_shop_active=False;self.active_battle=None
         self.hitboxes=[];self.result=None;self.page=0;self.revision+=1
         self.reward_check=False;self.reward_stable=0;self.reward_popups=[]
